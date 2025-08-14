@@ -1,0 +1,92 @@
+"""
+Real-time Streaming RAG Implementation
+
+Features:
+- Server-Sent Events (SSE) for real-time streaming
+- Progressive response generation
+- WebSocket support for bi-directional communication
+- Adaptive streaming based on connection quality
+"""
+
+import asyncio
+import json
+import time
+import logging
+from typing import AsyncIterator, Dict, Any, Optional
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+import ollama
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class StreamingRAGEngine:
+    """
+    RAG engine with real-time streaming capabilities
+    """
+    
+    def __init__(self, rag_engine):
+        self.rag_engine = rag_engine
+        self.client = rag_engine.client
+        self.active_streams = {}
+        
+    async def stream_query_sse(
+        self,
+        question: str,
+        stream_id: str,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        Stream query response using Server-Sent Events
+        """
+        try:
+            self.active_streams[stream_id] = {
+                'status': 'initializing',
+                'start_time': time.time(),
+                'question': question
+            }
+            
+            # Send initialization event
+            yield self._format_sse_event('init', {
+                'stream_id': stream_id,
+                'status': 'starting',
+                'question': question
+            })
+            
+            # Phase 1: Document Retrieval
+            self.active_streams[stream_id]['status'] = 'retrieving'
+            yield self._format_sse_event('status', {'phase': 'retrieving_documents'})
+            
+            # Get query embedding
+            query_embedding = self.rag_engine.embedding_generator.generate_single_embedding(question)
+            
+            # Retrieve documents with progress updates
+            similar_docs = self.rag_engine.vector_store.similarity_search(
+                query_embedding=query_embedding,
+                top_k=kwargs.get('top_k', 5),
+                score_threshold=kwargs.get('score_threshold', 0.3)
+            )
+            
+            yield self._format_sse_event('documents_retrieved', {
+                'count': len(similar_docs),
+                'sources': [doc['metadata']['source'].split('/')[-1] for doc in similar_docs[:3]]
+            })
+            
+            if not similar_docs:
+                yield self._format_sse_event('error', {
+                    'message': 'No relevant documents found'
+                })
+                return
+            
+            # Phase 2: Context Preparation
+            self.active_streams[stream_id]['status'] = 'preparing'
+            yield self._format_sse_event('status', {'phase': 'preparing_context'})
+            
+            context = self._create_context_prompt(question, similar_docs)
+            
+            # Phase 3: Streaming Generation
+            self.active_streams[stream_id]['status'] = 'generating'
+            yield self._format_sse_event('status', {'phase': 'generating_response'})
+            
+            # Stream the actual LLM response
+            full_response = \"\"\n            token_count = 0\n            \n            async for chunk in self._stream_llm_response(context, **kwargs):\n                if stream_id not in self.active_streams:\n                    break  # Stream was cancelled\n                    \n                full_response += chunk\n                token_count += 1\n                \n                yield self._format_sse_event('token', {\n                    'content': chunk,\n                    'token_count': token_count\n                })\n                \n                # Send periodic progress updates\n                if token_count % 20 == 0:\n                    yield self._format_sse_event('progress', {\n                        'tokens_generated': token_count,\n                        'estimated_completion': min(0.95, token_count / kwargs.get('max_tokens', 1024))\n                    })\n            \n            # Phase 4: Completion\n            processing_time = time.time() - self.active_streams[stream_id]['start_time']\n            \n            # Prepare sources\n            sources = []\n            for doc in similar_docs[:5]:\n                sources.append({\n                    'source': doc['metadata']['source'].split('/')[-1],\n                    'score': round(doc['metadata']['score'], 3),\n                    'preview': doc['content'][:100] + \"...\" if len(doc['content']) > 100 else doc['content']\n                })\n            \n            yield self._format_sse_event('complete', {\n                'full_response': full_response,\n                'sources': sources,\n                'processing_time_ms': round(processing_time * 1000, 2),\n                'total_tokens': token_count\n            })\n            \n            # Cleanup\n            self.active_streams[stream_id]['status'] = 'completed'\n            \n        except Exception as e:\n            logger.error(f\"Streaming error: {str(e)}\")\n            yield self._format_sse_event('error', {\n                'message': str(e),\n                'phase': self.active_streams.get(stream_id, {}).get('status', 'unknown')\n            })\n        finally:\n            if stream_id in self.active_streams:\n                del self.active_streams[stream_id]\n    \n    async def _stream_llm_response(\n        self, \n        prompt: str, \n        max_tokens: int = 2048,\n        temperature: float = 0.7,\n        **kwargs\n    ) -> AsyncIterator[str]:\n        \"\"\"Stream response from LLM\"\"\"\n        \n        try:\n            # For Ollama, we need to use the streaming API\n            stream = self.client.generate(\n                model=self.rag_engine.model_name,\n                prompt=prompt,\n                stream=True,\n                options={\n                    'temperature': temperature,\n                    'num_predict': max_tokens,\n                    'top_p': 0.9\n                }\n            )\n            \n            for chunk in stream:\n                if chunk.get('response'):\n                    yield chunk['response']\n                    \n                # Small delay to prevent overwhelming the client\n                await asyncio.sleep(0.01)\n                    \n        except Exception as e:\n            logger.error(f\"LLM streaming error: {str(e)}\")\n            yield f\"[Error: {str(e)}]\"\n    \n    def _create_context_prompt(self, query: str, documents) -> str:\n        \"\"\"Create prompt with context\"\"\"\n        context_parts = []\n        for i, doc in enumerate(documents, 1):\n            source = doc['metadata']['source'].split('/')[-1]\n            context_parts.append(\n                f\"Context {i}: {source} (Score: {doc['metadata']['score']:.3f})\\n{doc['content']}\\n\"\n            )\n        \n        context = \"\\n\".join(context_parts)\n        \n        return f\"\"\"You are a helpful customer support assistant. Use the provided context to answer the user's question accurately.\n\nCONTEXT:\n{context}\n\nQUESTION: {query}\n\nProvide a helpful, detailed answer based on the context:\"\"\"\n    \n    def _format_sse_event(self, event_type: str, data: Dict[str, Any]) -> str:\n        \"\"\"Format Server-Sent Event\"\"\"\n        return f\"event: {event_type}\\ndata: {json.dumps(data)}\\n\\n\"\n    \n    def cancel_stream(self, stream_id: str):\n        \"\"\"Cancel an active stream\"\"\"\n        if stream_id in self.active_streams:\n            logger.info(f\"Cancelling stream: {stream_id}\")\n            del self.active_streams[stream_id]\n    \n    def get_active_streams(self) -> Dict[str, Any]:\n        \"\"\"Get information about active streams\"\"\"\n        return {\n            stream_id: {\n                'status': info['status'],\n                'duration': time.time() - info['start_time'],\n                'question': info['question'][:50] + \"...\" if len(info['question']) > 50 else info['question']\n            }\n            for stream_id, info in self.active_streams.items()\n        }\n\nclass WebSocketRAGManager:\n    \"\"\"WebSocket manager for real-time RAG interactions\"\"\"\n    \n    def __init__(self, streaming_rag: StreamingRAGEngine):\n        self.streaming_rag = streaming_rag\n        self.connections: Dict[str, WebSocket] = {}\n        self.user_sessions: Dict[str, Dict[str, Any]] = {}\n    \n    async def connect(self, websocket: WebSocket, client_id: str):\n        \"\"\"Handle new WebSocket connection\"\"\"\n        await websocket.accept()\n        self.connections[client_id] = websocket\n        self.user_sessions[client_id] = {\n            'connected_at': time.time(),\n            'queries': [],\n            'active_streams': set()\n        }\n        \n        await self._send_message(websocket, 'connection', {\n            'status': 'connected',\n            'client_id': client_id,\n            'capabilities': ['streaming', 'real_time', 'multi_query']\n        })\n        \n        logger.info(f\"WebSocket client connected: {client_id}\")\n    \n    async def disconnect(self, client_id: str):\n        \"\"\"Handle WebSocket disconnection\"\"\"\n        if client_id in self.connections:\n            # Cancel any active streams for this client\n            if client_id in self.user_sessions:\n                for stream_id in self.user_sessions[client_id].get('active_streams', set()):\n                    self.streaming_rag.cancel_stream(stream_id)\n            \n            del self.connections[client_id]\n            if client_id in self.user_sessions:\n                del self.user_sessions[client_id]\n            \n            logger.info(f\"WebSocket client disconnected: {client_id}\")\n    \n    async def handle_message(self, websocket: WebSocket, client_id: str, message: Dict[str, Any]):\n        \"\"\"Handle incoming WebSocket message\"\"\"\n        try:\n            message_type = message.get('type')\n            \n            if message_type == 'query':\n                await self._handle_query(websocket, client_id, message)\n            elif message_type == 'cancel':\n                await self._handle_cancel(websocket, client_id, message)\n            elif message_type == 'feedback':\n                await self._handle_feedback(websocket, client_id, message)\n            elif message_type == 'ping':\n                await self._send_message(websocket, 'pong', {'timestamp': time.time()})\n            else:\n                await self._send_message(websocket, 'error', {\n                    'message': f'Unknown message type: {message_type}'\n                })\n                \n        except Exception as e:\n            logger.error(f\"Error handling WebSocket message: {str(e)}\")\n            await self._send_message(websocket, 'error', {\n                'message': 'Internal server error'\n            })\n    \n    async def _handle_query(self, websocket: WebSocket, client_id: str, message: Dict[str, Any]):\n        \"\"\"Handle query message\"\"\"\n        question = message.get('question', '').strip()\n        if not question:\n            await self._send_message(websocket, 'error', {\n                'message': 'Question cannot be empty'\n            })\n            return\n        \n        # Generate unique stream ID\n        stream_id = f\"{client_id}_{int(time.time() * 1000)}\"\n        \n        # Add to user session\n        if client_id in self.user_sessions:\n            self.user_sessions[client_id]['queries'].append({\n                'question': question,\n                'timestamp': time.time(),\n                'stream_id': stream_id\n            })\n            self.user_sessions[client_id]['active_streams'].add(stream_id)\n        \n        # Send acknowledgment\n        await self._send_message(websocket, 'query_started', {\n            'stream_id': stream_id,\n            'question': question\n        })\n        \n        try:\n            # Stream the response\n            async for sse_data in self.streaming_rag.stream_query_sse(\n                question=question,\n                stream_id=stream_id,\n                **message.get('params', {})\n            ):\n                # Parse SSE data and send as WebSocket message\n                if sse_data.startswith('event:'):\n                    lines = sse_data.strip().split('\\n')\n                    event_type = lines[0].split(':', 1)[1].strip()\n                    data_line = next((line for line in lines if line.startswith('data:')), '')\n                    \n                    if data_line:\n                        try:\n                            data = json.loads(data_line.split(':', 1)[1].strip())\n                            await self._send_message(websocket, event_type, {\n                                'stream_id': stream_id,\n                                **data\n                            })\n                        except json.JSONDecodeError:\n                            continue\n        \n        except Exception as e:\n            logger.error(f\"Error in query streaming: {str(e)}\")\n            await self._send_message(websocket, 'error', {\n                'stream_id': stream_id,\n                'message': str(e)\n            })\n        \n        finally:\n            # Remove from active streams\n            if client_id in self.user_sessions and 'active_streams' in self.user_sessions[client_id]:\n                self.user_sessions[client_id]['active_streams'].discard(stream_id)\n    \n    async def _handle_cancel(self, websocket: WebSocket, client_id: str, message: Dict[str, Any]):\n        \"\"\"Handle stream cancellation\"\"\"\n        stream_id = message.get('stream_id')\n        if stream_id:\n            self.streaming_rag.cancel_stream(stream_id)\n            \n            if client_id in self.user_sessions and 'active_streams' in self.user_sessions[client_id]:\n                self.user_sessions[client_id]['active_streams'].discard(stream_id)\n            \n            await self._send_message(websocket, 'cancelled', {\n                'stream_id': stream_id\n            })\n    \n    async def _handle_feedback(self, websocket: WebSocket, client_id: str, message: Dict[str, Any]):\n        \"\"\"Handle user feedback\"\"\"\n        # This would integrate with your metrics collector\n        await self._send_message(websocket, 'feedback_received', {\n            'status': 'success'\n        })\n    \n    async def _send_message(self, websocket: WebSocket, message_type: str, data: Dict[str, Any]):\n        \"\"\"Send message to WebSocket client\"\"\"\n        message = {\n            'type': message_type,\n            'timestamp': time.time(),\n            **data\n        }\n        \n        try:\n            await websocket.send_text(json.dumps(message))\n        except Exception as e:\n            logger.error(f\"Error sending WebSocket message: {str(e)}\")\n    \n    async def broadcast(self, message_type: str, data: Dict[str, Any], exclude_clients: set = None):\n        \"\"\"Broadcast message to all connected clients\"\"\"\n        exclude_clients = exclude_clients or set()\n        \n        for client_id, websocket in self.connections.items():\n            if client_id not in exclude_clients:\n                try:\n                    await self._send_message(websocket, message_type, data)\n                except Exception as e:\n                    logger.error(f\"Error broadcasting to {client_id}: {str(e)}\")\n    \n    def get_connection_stats(self) -> Dict[str, Any]:\n        \"\"\"Get connection statistics\"\"\"\n        return {\n            'total_connections': len(self.connections),\n            'active_streams': sum(\n                len(session.get('active_streams', set())) \n                for session in self.user_sessions.values()\n            ),\n            'clients': {\n                client_id: {\n                    'connected_duration': time.time() - session['connected_at'],\n                    'total_queries': len(session['queries']),\n                    'active_streams': len(session.get('active_streams', set()))\n                }\n                for client_id, session in self.user_sessions.items()\n            }\n        }\n\nclass AdaptiveStreamingController:\n    \"\"\"Controls streaming behavior based on connection quality and user preferences\"\"\"\n    \n    def __init__(self):\n        self.client_preferences = {}\n        self.connection_quality = {}\n    \n    def update_connection_quality(self, client_id: str, metrics: Dict[str, Any]):\n        \"\"\"Update connection quality metrics\"\"\"\n        self.connection_quality[client_id] = {\n            'latency': metrics.get('latency', 100),\n            'bandwidth': metrics.get('bandwidth', 'unknown'),\n            'reliability': metrics.get('reliability', 0.95),\n            'last_updated': time.time()\n        }\n    \n    def get_streaming_params(self, client_id: str) -> Dict[str, Any]:\n        \"\"\"Get optimized streaming parameters for client\"\"\"\n        quality = self.connection_quality.get(client_id, {})\n        preferences = self.client_preferences.get(client_id, {})\n        \n        # Adaptive parameters based on connection quality\n        if quality.get('latency', 100) > 500:  # High latency\n            return {\n                'chunk_size': 10,  # Larger chunks\n                'delay_ms': 50,    # Less frequent updates\n                'compression': True\n            }\n        elif quality.get('latency', 100) < 50:  # Low latency\n            return {\n                'chunk_size': 1,   # Smaller chunks (more real-time)\n                'delay_ms': 10,    # More frequent updates\n                'compression': False\n            }\n        else:  # Normal latency\n            return {\n                'chunk_size': 3,\n                'delay_ms': 20,\n                'compression': False\n            }\n    \n    def set_user_preferences(self, client_id: str, preferences: Dict[str, Any]):\n        \"\"\"Set user streaming preferences\"\"\"\n        self.client_preferences[client_id] = preferences
