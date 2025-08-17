@@ -2,10 +2,14 @@ import streamlit as st
 import requests
 import json
 import time
+import logging
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 API_BASE_URL = "http://localhost:8000"
@@ -118,8 +122,8 @@ def get_metrics():
         response = requests.get(f"{API_BASE_URL}/metrics")
         if response.status_code == 200:
             return response.json()
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get metrics: {str(e)}")
     return None
 
 def upload_documents(files, overwrite=False, chunk_size=500, chunk_overlap=50):
